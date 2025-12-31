@@ -1,0 +1,275 @@
+# Safe workflow: create global Vercel secrets from AWS Secrets Manager
+# and create Vercel project environment variables that reference those secrets by UID.
+#
+# - Required repository secrets:
+#   - AWS_ROLE_ARN = arn:aws:iam::ACCOUNT:role/RoleToAssume
+#   - VERCEL_TOKEN = Vercel personal token (scoped to manage secrets & project envs)
+# - Required repo env input (set in workflow_dispatch or as repository secret/env):
+#   - VERCEL_PROJECT_ID = your-vercel-project-id
+#
+# Behavior:
+# - Manual-only run (workflow_dispatch) by default for safety.
+# - For each SECRET_MAP entry:
+#     * Fetch secret from AWS Secrets Manager (SecretString or SecretBinary)
+#     * Split JSON DB secrets into parts (USER/PASS/HOST/NAME) and compose prefixed DATABASE_URL
+#     * Create/upsert global Vercel secrets (v2 API). Vercel secrets are immutable, so existing secret is deleted and recreated.
+#     * Create/upsert a project environment variable that references the newly-created global secret UID (type: "secret", value: <secret_uid>).
+# - Produces an artifact mapping file (tab-separated): ENV_VAR<TAB>VERCEL_SECRET_NAME (no raw secret values).
+#
+name: Inject AWS Secrets -> Vercel Secrets & Project Envs (safe)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-secrets:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      # Set this project id either here, or pass via workflow_dispatch inputs or repository secret/env
+      VERCEL_PROJECT_ID: animated-journey1-r6h1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-vercel-secrets
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl coreutils
+
+      - name: Create global Vercel secrets and project env refs (safe)
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          # ---- CONFIG: map AWS Secret Manager secret IDs -> VERCEL prefix ----
+          # Edit this mapping for your secrets.
+          # Example: SECRET_MAP["myapp/prod/database"]="DB"
+          declare -A SECRET_MAP
+          SECRET_MAP["myapp/prod/database"]="DB"
+
+          # Where mapping file will be written (ENV_VAR<TAB>VERCEL_SECRET_NAME)
+          MAPPING_FILE="secrets-mapping.txt"
+          echo "# ENV_VAR<TAB>VERCEL_SECRET_NAME" > "$MAPPING_FILE"
+
+          # ---- helper: simple retry wrapper ----
+          retry() {
+            local -r -i max=5
+            local -i i=0
+            local -i exit_code=0
+            local sleep_for=1
+            until "$@"; do
+              exit_code=$?
+              i=$((i+1))
+              if [ "$i" -ge "$max" ]; then
+                echo "Command failed after $i attempts: $*"
+                return $exit_code
+              fi
+              sleep $sleep_for
+              sleep_for=$((sleep_for * 2))
+            done
+            return 0
+          }
+
+          # ---- Vercel API helpers (v2 secrets + v9 project envs) ----
+
+          # List global secrets (returns JSON)
+          list_vercel_secrets() {
+            curl -fsSL -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com/v2/secrets"
+          }
+
+          # Find global secret UID by name
+          find_vercel_secret_uid() {
+            local name="$1"
+            list_vercel_secrets | jq -r --arg NAME "$name" '.secrets[]? | select(.name == $NAME) | .uid' || true
+          }
+
+          # Delete global secret by UID
+          delete_vercel_secret_by_uid() {
+            local uid="$1"
+            if [[ -n "$uid" ]]; then
+              curl -fsSL -X DELETE -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com/v2/secrets/${uid}" >/dev/null || true
+            fi
+          }
+
+          # Create global secret (name,value) -> returns uid
+          create_vercel_secret() {
+            local name="$1"
+            local value="$2"
+            echo "::add-mask::$value"
+            resp=$(curl -s -w "\n%{http_code}" -X POST "https://api.vercel.com/v2/secrets" \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg name "$name" --arg value "$value" '{ name: $name, value: $value }')")
+            code=$(echo "$resp" | tail -n1)
+            body=$(echo "$resp" | sed '$d')
+            if [[ "$code" -ge 400 ]]; then
+              echo "Failed to create secret $name. HTTP $code. Response: $body"
+              return 1
+            fi
+            echo "$body" | jq -r '.uid // .id // empty'
+          }
+
+          # Upsert global secret: delete existing then recreate (Vercel secrets are immutable)
+          upsert_vercel_secret() {
+            local secret_name="$1"
+            local secret_value="$2"
+            existing_uid=$(find_vercel_secret_uid "$secret_name" || true)
+            if [[ -n "$existing_uid" ]]; then
+              echo "Existing global secret found for '$secret_name' (uid: $existing_uid). Deleting before recreation."
+              retry delete_vercel_secret_by_uid "$existing_uid"
+            fi
+            new_uid=$(create_vercel_secret "$secret_name" "$secret_value")
+            if [[ -z "$new_uid" ]]; then
+              echo "Failed to create global secret $secret_name"
+              return 1
+            fi
+            echo "$new_uid"
+          }
+
+          # Project env helpers (v9)
+          list_project_envs() {
+            curl -fsSL -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env?limit=1000"
+          }
+
+          # Find project env id by key
+          find_project_env_id() {
+            local key="$1"
+            list_project_envs | jq -r --arg KEY "$key" '.envs[]? | select(.key == $KEY) | .id' || true
+          }
+
+          # Upsert project environment var that references a global secret UID (type: "secret")
+          upsert_project_env_secret_ref() {
+            local env_key="$1"
+            local secret_uid="$2"
+            local target='["production"]' # adjust targets if needed: preview/development etc.
+
+            echo "Creating/updating project env '$env_key' -> secret uid $secret_uid"
+
+            existing_env_id=$(find_project_env_id "$env_key" || true)
+            if [[ -n "$existing_env_id" && "$existing_env_id" != "null" ]]; then
+              # PATCH existing env entry
+              resp=$(curl -s -w "\n%{http_code}" -X PATCH \
+                "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env/${existing_env_id}" \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg v "$secret_uid" --argjson tgt "${target}" '{ value: $v, target: $tgt, type: "secret" }')")
+              code=$(echo "$resp" | tail -n1)
+              body=$(echo "$resp" | sed '$d')
+              if [[ "$code" -ge 400 ]]; then
+                echo "Failed to update project env $env_key. HTTP $code. Response: $body"
+                return 1
+              fi
+            else
+              # Create new env var referencing secret UID
+              resp=$(curl -s -w "\n%{http_code}" -X POST \
+                "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env" \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg k "$env_key" --arg v "$secret_uid" --argjson tgt "${target}" '{ key: $k, value: $v, target: $tgt, type: "secret" }')")
+              code=$(echo "$resp" | tail -n1)
+              body=$(echo "$resp" | sed '$d')
+              if [[ "$code" -ge 400 ]]; then
+                echo "Failed to create project env $env_key. HTTP $code. Response: $body"
+                return 1
+              fi
+            fi
+          }
+
+          # ---- Process each mapped AWS secret ----
+          for aws_secret_id in "${!SECRET_MAP[@]}"; do
+            echo "Processing AWS Secrets Manager secret: $aws_secret_id"
+
+            # Try SecretString first
+            secret_json=$(aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$aws_secret_id" --query SecretString --output text 2>/dev/null || true)
+
+            # If SecretString empty, try SecretBinary and base64-decode it
+            if [[ -z "${secret_json:-}" || "$secret_json" == "None" ]]; then
+              secret_binary=$(aws secretsmanager get-secret-value --region "$AWS_REGION" --secret-id "$aws_secret_id" --query SecretBinary --output text 2>/dev/null || true)
+              if [[ -n "${secret_binary:-}" && "$secret_binary" != "None" ]]; then
+                secret_json=$(echo "$secret_binary" | base64 --decode)
+              fi
+            fi
+
+            if [[ -z "${secret_json:-}" || "$secret_json" == "None" ]]; then
+              echo "Warning: secret $aws_secret_id returned empty. Skipping."
+              continue
+            fi
+
+            prefix="${SECRET_MAP[$aws_secret_id]}"
+
+            # If JSON, try to split into DB fields and create multiple secrets/envs
+            if echo "$secret_json" | jq -e . >/dev/null 2>&1; then
+              db_user=$(echo "$secret_json" | jq -r '.username // .user // empty')
+              db_pass=$(echo "$secret_json" | jq -r '.password // .pass // empty')
+              db_host=$(echo "$secret_json" | jq -r '.host // .hostname // empty')
+              db_name=$(echo "$secret_json" | jq -r '.dbname // .name // empty')
+
+              if [[ -n "$db_user" ]]; then
+                secret_name="${prefix}_USER"
+                uid=$(upsert_vercel_secret "$secret_name" "$db_user")
+                upsert_project_env_secret_ref "${prefix}_USER" "$uid"
+                echo -e "${prefix}_USER\t${secret_name}" >> "$MAPPING_FILE"
+              fi
+
+              if [[ -n "$db_pass" ]]; then
+                secret_name="${prefix}_PASS"
+                uid=$(upsert_vercel_secret "$secret_name" "$db_pass")
+                upsert_project_env_secret_ref "${prefix}_PASS" "$uid"
+                echo -e "${prefix}_PASS\t${secret_name}" >> "$MAPPING_FILE"
+              fi
+
+              if [[ -n "$db_host" ]]; then
+                secret_name="${prefix}_HOST"
+                uid=$(upsert_vercel_secret "$secret_name" "$db_host")
+                upsert_project_env_secret_ref "${prefix}_HOST" "$uid"
+                echo -e "${prefix}_HOST\t${secret_name}" >> "$MAPPING_FILE"
+              fi
+
+              if [[ -n "$db_name" ]]; then
+                secret_name="${prefix}_NAME"
+                uid=$(upsert_vercel_secret "$secret_name" "$db_name")
+                upsert_project_env_secret_ref "${prefix}_NAME" "$uid"
+                echo -e "${prefix}_NAME\t${secret_name}" >> "$MAPPING_FILE"
+              fi
+
+              # Compose prefixed DATABASE_URL ONLY to avoid clobbering global DATABASE_URL
+              if [[ -n "$db_user" && -n "$db_pass" && -n "$db_host" && -n "$db_name" ]]; then
+                db_url="postgres://${db_user}:${db_pass}@${db_host}:5432/${db_name}"
+                secret_name="${prefix}_DATABASE_URL"
+                uid=$(upsert_vercel_secret "$secret_name" "$db_url")
+                upsert_project_env_secret_ref "${prefix}_DATABASE_URL" "$uid"
+                echo -e "${prefix}_DATABASE_URL\t${secret_name}" >> "$MAPPING_FILE"
+              fi
+            else
+              # Not JSON: store as single value under PREFIX_VALUE
+              secret_name="${prefix}_VALUE"
+              uid=$(upsert_vercel_secret "$secret_name" "$secret_json")
+              upsert_project_env_secret_ref "${prefix}_VALUE" "$uid"
+              echo -e "${prefix}_VALUE\t${secret_name}" >> "$MAPPING_FILE"
+            fi
+
+            echo "Finished processing $aws_secret_id"
+          done
+
+          echo "Mapping file written to $MAPPING_FILE (ENV_VAR<TAB>VERCEL_SECRET_NAME)."
+      - name: Upload mapping artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-secrets-mapping
+          path: secrets-mapping.txt
